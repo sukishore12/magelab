@@ -24,7 +24,9 @@ Configuration (all optional, read from the environment):
 
     MAGELAB_GATEWAY_URL     base URL of the proxy   (default http://127.0.0.1:4000)
     MAGELAB_GATEWAY_TOKEN   token the proxy expects (default sk-magelab-local)
-    MAGELAB_MODEL_PRICES    JSON: {"<model>": {"input": <usd/MTok>, "output": <usd/MTok>}}
+    MAGELAB_MODEL_PRICES    JSON, USD per million tokens, keyed by model id:
+                            {"<model>": {"input": .., "output": .., "cached_input": ..}}
+                            `cached_input` is optional and falls back to `input`.
 """
 
 import json
@@ -91,6 +93,21 @@ def gateway_env(model: Optional[str]) -> dict[str, str]:
     }
 
 
+def effective_prices(models: Optional[list[str]] = None) -> dict[str, dict[str, float]]:
+    """The configured prices, optionally narrowed to `models`.
+
+    Exposed so a caller can record what a run was actually costed at. A price
+    that lives only in an operator's shell is not auditable six months later —
+    stamping it beside the cost makes the number reproducible, and makes an
+    later correction to the table visibly a different number rather than a
+    silently incomparable one.
+    """
+    prices = _prices()
+    if models is None:
+        return prices
+    return {m: prices[m] for m in dict.fromkeys(models) if m in prices}
+
+
 def _prices() -> dict[str, dict[str, float]]:
     raw = os.environ.get("MAGELAB_MODEL_PRICES", "").strip()
     if not raw:
@@ -140,19 +157,30 @@ def cost_from_usage(model: Optional[str], usage: Any) -> Optional[float]:
                 return int(v)
         return 0
 
-    # Cache reads/writes are billed at different rates upstream; count them as
-    # input here rather than silently dropping them from the total.
-    input_tokens = (
-        _tokens("input_tokens", "prompt_tokens")
-        + _tokens("cache_read_input_tokens")
-        + _tokens("cache_creation_input_tokens")
-    )
+    # Anthropic's convention, which is what the gateway's responses are shaped
+    # to: input_tokens counts only what was NOT served from cache, and cache
+    # reads are reported separately. They are billed far more cheaply — $0.02
+    # against $0.20 per MTok on gpt-5.6-luna — so charging them as ordinary
+    # input would overstate a long deliberation, where each turn re-sends the
+    # whole accumulated thread.
+    fresh_input = _tokens("input_tokens", "prompt_tokens")
+    cached_input = _tokens("cache_read_input_tokens", "cached_tokens")
+    cache_writes = _tokens("cache_creation_input_tokens")
     output_tokens = _tokens("output_tokens", "completion_tokens")
     try:
-        return (input_tokens / 1_000_000) * float(price["input"]) + (output_tokens / 1_000_000) * float(price["output"])
+        rate_in = float(price["input"])
+        rate_out = float(price["output"])
+        # No separate cached rate configured: price cache reads as input, which
+        # over-counts rather than under-counts.
+        rate_cached = float(price.get("cached_input", rate_in))
     except (KeyError, TypeError, ValueError):
         logger.warning("Price entry for '%s' needs numeric 'input' and 'output' keys — ignoring", model)
         return None
+    return (
+        ((fresh_input + cache_writes) / 1_000_000) * rate_in
+        + (cached_input / 1_000_000) * rate_cached
+        + (output_tokens / 1_000_000) * rate_out
+    )
 
 
 def check_gateway_reachable(timeout: float = 5.0) -> Optional[str]:
