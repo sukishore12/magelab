@@ -1,6 +1,37 @@
 import pytest
 
-from magelab.orchestrator import RunOutcome
+from magelab.orchestrator import Orchestrator, RunOutcome
+
+
+# ---------------------------------------------------------------------------
+# 0. _compute_outcome — task counts and sync-round handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "timed_out, succeeded, failed, open_, sync_rounds, expected",
+    [
+        # Task-based runs (no sync rounds) behave as before.
+        (False, 0, 0, 0, None, RunOutcome.NO_WORK),
+        (False, 2, 0, 0, None, RunOutcome.SUCCESS),
+        (False, 1, 1, 0, None, RunOutcome.PARTIAL),
+        (False, 0, 2, 0, None, RunOutcome.FAILURE),
+        (True, 5, 0, 0, None, RunOutcome.TIMEOUT),
+        # Sync deliberations do their work via rounds, not tasks: a run that
+        # executed rounds and did not time out completed cleanly → SUCCESS.
+        (False, 0, 0, 0, 3, RunOutcome.SUCCESS),
+        # Sync mode that never ran a round (no messages) is still NO_WORK.
+        (False, 0, 0, 0, 0, RunOutcome.NO_WORK),
+        (False, 0, 0, 0, None, RunOutcome.NO_WORK),
+        # A timeout still dominates even if rounds ran.
+        (True, 0, 0, 0, 3, RunOutcome.TIMEOUT),
+    ],
+)
+def test_compute_outcome(timed_out, succeeded, failed, open_, sync_rounds, expected):
+    assert (
+        Orchestrator._compute_outcome(timed_out, succeeded, failed, open_, sync_rounds=sync_rounds)
+        == expected
+    )
 
 
 # ---------------------------------------------------------------------------

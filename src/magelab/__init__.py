@@ -12,7 +12,7 @@ via submodule imports, e.g. ``from magelab.state.task_schemas import Task``.
 """
 
 from .auth import ResolvedAuth, resolve_api_key, resolve_sub
-from .orchestrator import RunOutcome
+from .orchestrator import RunOutcome, TurnPolicy
 from .org_config import OrgConfig, OrgSettings, ResumeMode
 from .pipeline import run_in_workspace, run_pipeline, run_pipeline_batch, view_run, view_run_batch
 from .pipeline.execution import StageFn
@@ -31,6 +31,7 @@ __all__ = [
     "view_run",
     "view_run_batch",
     "RunOutcome",
+    "TurnPolicy",
     "RunView",
     "StageFn",
 ]

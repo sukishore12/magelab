@@ -14,7 +14,7 @@ from aiohttp import web
 
 from ..org_config import OrgConfig
 from ..events import Event
-from ..orchestrator import Orchestrator
+from ..orchestrator import Orchestrator, TurnPolicy
 from ..state.registry import Registry
 from ..state.registry_schemas import AgentState
 from ..state.task_store import TaskStore
@@ -394,6 +394,7 @@ async def run_with_frontend(
             sync=org_config.settings.sync,
             sync_max_rounds=org_config.settings.sync_max_rounds,
             sync_round_timeout_seconds=org_config.settings.sync_round_timeout_seconds,
+            turn_policy=TurnPolicy.from_settings(org_config.settings),
         )
 
         # 8. Broadcast run_finished

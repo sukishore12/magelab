@@ -13,6 +13,7 @@ import dataclasses
 import json
 import logging
 import os
+import random
 import shutil
 from datetime import datetime, timezone
 from enum import Enum
@@ -29,7 +30,7 @@ from .events import (
     TaskAssignedEvent,
     WireMessageEvent,
 )
-from .org_config import OrgConfig, ResumeMode, WireNotifications
+from .org_config import OrgConfig, OrgSettings, ResumeMode, WireNotifications
 from .runners.agent_runner import AgentRunner, AgentRunResult
 from .runners.claude_runner import ClaudeRunner
 from .runners.prompts import (
@@ -166,6 +167,61 @@ def _copy_session_configs(
 
 
 # =============================================================================
+# Turn policy (sync mode)
+# =============================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class TurnPolicy:
+    """How the agents of a sync round are scheduled against each other.
+
+    Default (``enabled=False``) is the original all-at-once round: every queue is
+    drained up front and every agent runs concurrently against the same frozen
+    snapshot of the previous round, so nobody can answer anything said in their own
+    round.
+
+    With ``enabled=True`` the round becomes turn-taking: agents run one at a time,
+    each draining its own queue when its turn arrives, so a later speaker sees what
+    the earlier speakers said in the SAME round.
+    """
+
+    enabled: bool = False
+    order: str = "random"
+    """"random" — fresh shuffle every round; "config" — registry order, every round."""
+    seed: Optional[int] = None
+    """Base seed for the shuffle. None = drawn at run start. Each round derives its
+    own stream from (seed, round_num), so round N's order does not depend on how many
+    agents happened to speak in round N-1."""
+    first: tuple[str, ...] = ()
+    """Agent ids pinned to the front of every round, in the order given. Everyone
+    else is shuffled behind them."""
+
+    @classmethod
+    def from_settings(cls, settings: "OrgSettings") -> "TurnPolicy":
+        """Build from an OrgSettings' sync_turn_* fields."""
+        return cls(
+            enabled=settings.sync_turn_taking,
+            order=settings.sync_turn_order,
+            seed=settings.sync_turn_seed,
+            first=tuple(settings.sync_turn_first),
+        )
+
+    def draw(self, agent_ids: list[str], round_num: int) -> list[str]:
+        """The speaking order for one round: pinned agents first, then the rest.
+
+        With order="random" the tail is shuffled from a stream keyed on (seed,
+        round_num) — so a round's order depends only on the seed and the round number,
+        not on what happened in earlier rounds. Pure: callers can draw the same orders
+        ahead of a run (e.g. a pre-flight check) without running anything.
+        """
+        pinned = [a for a in self.first if a in agent_ids]
+        rest = [a for a in agent_ids if a not in pinned]
+        if self.order == "random":
+            random.Random(f"{self.seed}:{round_num}").shuffle(rest)
+        return pinned + rest
+
+
+# =============================================================================
 # Orchestrator
 # =============================================================================
 
@@ -223,11 +279,13 @@ class Orchestrator:
         self._interrupted = False
         self._agent_tasks: dict[str, asyncio.Task] = {}  # agent_id -> asyncio task
         self._event_listeners: list[Callable[[Event], None]] = []
+        self._turn_policy: TurnPolicy = TurnPolicy()
         self._events_to_process: int = 0
 
         # Run results — set during the run or at finalization
         self.timed_out: bool = False
         self.sync_rounds: Optional[int] = None
+        self.turn_orders: list[list[str]] = []  # turn-taking mode: the order drawn each round
         self.outcome: RunOutcome = RunOutcome.NO_WORK
         self.duration_seconds: Optional[float] = None
         self.total_cost_usd: float = 0.0
@@ -398,6 +456,7 @@ class Orchestrator:
         sync: bool = False,
         sync_max_rounds: Optional[int] = None,
         sync_round_timeout_seconds: Optional[float] = None,
+        turn_policy: Optional[TurnPolicy] = None,
     ) -> None:
         """
         Run the multi-agent organization.
@@ -409,6 +468,8 @@ class Orchestrator:
             sync: If True, run in synchronized round-based mode (no agent loops).
             sync_max_rounds: Maximum number of rounds. Required when sync=True.
             sync_round_timeout_seconds: Max time per sync round. None = no per-round limit.
+            turn_policy: How agents are scheduled within a round. None or a policy with
+                enabled=False keeps the all-at-once round. Only valid when sync=True.
         """
         if sync_max_rounds is not None and not sync:
             raise ValueError("sync_max_rounds can only be specified when sync=True")
@@ -416,7 +477,10 @@ class Orchestrator:
             raise ValueError("sync_max_rounds is required when sync=True")
         if sync_round_timeout_seconds is not None and not sync:
             raise ValueError("sync_round_timeout_seconds can only be specified when sync=True")
+        if turn_policy is not None and turn_policy.enabled and not sync:
+            raise ValueError("turn_policy can only be enabled when sync=True")
         if sync:
+            self._turn_policy = self._resolve_turn_policy(turn_policy)
             await self._run_with_lifecycle(
                 initial_tasks,
                 initial_messages,
@@ -580,12 +644,28 @@ class Orchestrator:
         self._agent_tasks.clear()
 
     @staticmethod
-    def _compute_outcome(timed_out: bool, tasks_succeeded: int, tasks_failed: int, tasks_open: int) -> RunOutcome:
-        """Compute the overall run outcome from task counts."""
+    def _compute_outcome(
+        timed_out: bool,
+        tasks_succeeded: int,
+        tasks_failed: int,
+        tasks_open: int,
+        sync_rounds: Optional[int] = None,
+    ) -> RunOutcome:
+        """Compute the overall run outcome from task counts.
+
+        Sync (round-based) deliberations do their work through message rounds
+        rather than the task subsystem, so their task counts are all zero even
+        on a fully successful run. When no tasks exist but sync rounds actually
+        executed, the run did work and completed cleanly — report SUCCESS rather
+        than NO_WORK. (Domain-level results such as a vote's majority /
+        no-majority are recorded by the agents themselves, not by this enum.)
+        """
         if timed_out:
             return RunOutcome.TIMEOUT
         total = tasks_succeeded + tasks_failed + tasks_open
         if total == 0:
+            if sync_rounds and sync_rounds > 0:
+                return RunOutcome.SUCCESS
             return RunOutcome.NO_WORK
         if tasks_succeeded == total:
             return RunOutcome.SUCCESS
@@ -612,6 +692,7 @@ class Orchestrator:
                 task_counts["succeeded"],
                 task_counts["failed"],
                 task_counts["open"],
+                sync_rounds=self.sync_rounds,
             )
             self.duration_seconds = duration_seconds
             self.total_cost_usd = summary["total_cost_usd"]
@@ -731,41 +812,130 @@ class Orchestrator:
 
         self._framework_logger.info(f"Agent {agent_id} loop stopped")
 
+    def _resolve_turn_policy(self, policy: Optional[TurnPolicy]) -> TurnPolicy:
+        """Finalize the turn policy for a run: draw a seed if the caller left it open.
+
+        The seed is drawn once per run (not per round) and logged, so a run can be
+        replayed turn-for-turn by passing it back in.
+        """
+        policy = policy or TurnPolicy()
+        if not policy.enabled:
+            return policy
+        if policy.seed is None:
+            policy = dataclasses.replace(policy, seed=random.randrange(2**31))
+        self._framework_logger.info(
+            f"Turn-taking rounds: order={policy.order}, seed={policy.seed}"
+            + (f", first={list(policy.first)}" if policy.first else "")
+        )
+        return policy
+
     async def _run_sync_rounds(self, sync_max_rounds: int, sync_round_timeout_seconds: Optional[float] = None) -> None:
         """Execute sync rounds until convergence, all tasks done, or sync_max_rounds reached."""
         for round_num in range(1, sync_max_rounds + 1):
-            # Drain all agent queues
-            agent_events: dict[str, list[Event]] = {}
-            for agent_id in self.registry.list_agent_ids():
-                events = self.registry.drain_queue(agent_id)
-                if events:
-                    agent_events[agent_id] = events
+            if self._turn_policy.enabled:
+                dispatched = await self._run_round_turn_taking(round_num, sync_round_timeout_seconds)
+            else:
+                dispatched = await self._run_round_concurrent(round_num, sync_round_timeout_seconds)
 
-            if not agent_events:
+            if not dispatched:
                 self._framework_logger.info(f"No events after round {round_num - 1} — converged")
                 return
-
-            self._framework_logger.info(
-                f"Round {round_num}: dispatching events to {len(agent_events)} agents "
-                f"({sum(len(v) for v in agent_events.values())} events total)"
-            )
-
-            # Run all agents concurrently — sequential per agent, concurrent across agents
-            round_coro = asyncio.gather(
-                *(self._run_agent_events_sequential(agent_id, events) for agent_id, events in agent_events.items()),
-                return_exceptions=True,
-            )
-            if sync_round_timeout_seconds is not None:
-                try:
-                    await asyncio.wait_for(round_coro, timeout=sync_round_timeout_seconds)
-                except asyncio.TimeoutError:
-                    self._framework_logger.warning(f"Round {round_num} timed out after {sync_round_timeout_seconds}s")
-            else:
-                await round_coro
 
             self.sync_rounds = round_num
 
         self._framework_logger.warning(f"Max rounds ({sync_max_rounds}) reached")
+
+    async def _run_round_concurrent(self, round_num: int, round_timeout: Optional[float]) -> int:
+        """All-at-once round: drain every queue up front, run every agent concurrently.
+
+        Every agent works from the previous round's messages. Delivery within the
+        round is a race, not a guarantee: each agent's prompt is resolved when its own
+        dispatch starts, so an agent that finishes early can leak into a slower agent's
+        prompt. Turn-taking (TurnPolicy) replaces that race with a defined order.
+
+        Returns the number of agents dispatched (0 = converged).
+        """
+        agent_events: dict[str, list[Event]] = {}
+        for agent_id in self.registry.list_agent_ids():
+            events = self.registry.drain_queue(agent_id)
+            if events:
+                agent_events[agent_id] = events
+
+        if not agent_events:
+            return 0
+
+        self._framework_logger.info(
+            f"Round {round_num}: dispatching events to {len(agent_events)} agents "
+            f"({sum(len(v) for v in agent_events.values())} events total)"
+        )
+
+        # Run all agents concurrently — sequential per agent, concurrent across agents
+        round_coro = asyncio.gather(
+            *(self._run_agent_events_sequential(agent_id, events) for agent_id, events in agent_events.items()),
+            return_exceptions=True,
+        )
+        if round_timeout is not None:
+            try:
+                await asyncio.wait_for(round_coro, timeout=round_timeout)
+            except asyncio.TimeoutError:
+                self._framework_logger.warning(f"Round {round_num} timed out after {round_timeout}s")
+        else:
+            await round_coro
+
+        return len(agent_events)
+
+    async def _run_round_turn_taking(self, round_num: int, round_timeout: Optional[float]) -> int:
+        """Turn-taking round: one agent at a time, in this round's drawn order.
+
+        Each agent drains its own queue when its turn comes up, so it sees messages
+        sent earlier in this same round. An agent whose queue is empty at its turn is
+        skipped (it does not get a second chance later in the round — anything that
+        arrives after its turn waits for the next round). The order drawn and the
+        agents that actually spoke are recorded to run_turn_orders, including when the
+        round timeout cuts the round short.
+
+        Returns the number of agents that took a turn (0 = converged).
+        """
+        order = self._turn_policy.draw(self.registry.list_agent_ids(), round_num)
+        self.turn_orders.append(order)
+        spoke: list[str] = []
+
+        async def _take_turns() -> None:
+            for agent_id in order:
+                events = self.registry.drain_queue(agent_id)
+                if not events:
+                    continue
+                spoke.append(agent_id)
+                self._framework_logger.info(
+                    f"Round {round_num} turn {len(spoke)}/{len(order)}: {agent_id} ({len(events)} events)"
+                )
+                await self._run_agent_events_sequential(agent_id, events)
+
+        try:
+            if round_timeout is not None:
+                try:
+                    await asyncio.wait_for(_take_turns(), timeout=round_timeout)
+                except asyncio.TimeoutError:
+                    self._framework_logger.warning(
+                        f"Round {round_num} timed out after {round_timeout}s "
+                        f"({len(spoke)}/{len(order)} agents had taken a turn)"
+                    )
+            else:
+                await _take_turns()
+        finally:
+            if spoke:
+                self._db.record_turn_order(
+                    round_num=round_num,
+                    seed=self._turn_policy.seed,
+                    turn_order=order,
+                    spoke=spoke,
+                )
+            else:
+                self.turn_orders.pop()
+
+        if spoke:
+            self._framework_logger.info(f"Round {round_num} complete: {' -> '.join(spoke)}")
+        return len(spoke)
 
     async def _run_agent_events_sequential(self, agent_id: str, events: list[Event]) -> None:
         """Process an agent's events sequentially within a sync round.

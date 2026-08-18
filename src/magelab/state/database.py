@@ -7,10 +7,12 @@ and load queries via register_schema() and the execute/fetch primitives.
 
 Framework tables:
 - run_meta — one row per run segment (timing, outcome, costs, full OrgConfig JSON)
+- run_turn_orders — one row per sync round in turn-taking mode (order drawn, who spoke)
 - run_events — event lifecycle (enqueue → deliver → complete)
 - run_transcripts — agent conversation logs
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -164,6 +166,15 @@ class Database:
                 finished_at      TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS run_turn_orders (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_num    INTEGER NOT NULL,
+                seed         INTEGER,
+                turn_order   TEXT NOT NULL,
+                spoke        TEXT NOT NULL,
+                timestamp    TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS run_transcripts (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id     TEXT NOT NULL,
@@ -289,6 +300,50 @@ class Database:
             ),
         )
         self.commit()
+
+    # =========================================================================
+    # run_turn_orders
+    # =========================================================================
+
+    def record_turn_order(
+        self,
+        *,
+        round_num: int,
+        seed: Optional[int],
+        turn_order: list[str],
+        spoke: list[str],
+    ) -> None:
+        """Record one turn-taking round: the order drawn, and who actually took a turn.
+
+        ``spoke`` is a subset of ``turn_order`` — an agent with an empty queue when
+        its turn comes round is skipped, and a round cut short by the round timeout
+        records only the agents that ran before the cut.
+        """
+        self.execute(
+            "INSERT INTO run_turn_orders (round_num, seed, turn_order, spoke, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (
+                round_num,
+                seed,
+                json.dumps(turn_order),
+                json.dumps(spoke),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self.commit()
+
+    def load_turn_orders(self) -> list[dict]:
+        """Load every recorded turn order, oldest first. Empty in concurrent sync mode."""
+        rows = self.fetchall("SELECT * FROM run_turn_orders ORDER BY id")
+        return [
+            {
+                "round": r["round_num"],
+                "seed": r["seed"],
+                "turn_order": json.loads(r["turn_order"]),
+                "spoke": json.loads(r["spoke"]),
+                "timestamp": r["timestamp"],
+            }
+            for r in rows
+        ]
 
     def load_run_meta(self) -> Optional[dict]:
         """Load the latest run_meta row. Returns None if no run exists."""

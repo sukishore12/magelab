@@ -21,7 +21,7 @@ import yaml
 
 from ..auth import ResolvedAuth, stage_credentials
 from ..frontend.server import run_with_frontend, serve_view_frontend
-from ..orchestrator import Orchestrator, RunOutcome
+from ..orchestrator import Orchestrator, RunOutcome, TurnPolicy
 from ..org_config import OrgConfig, ResumeMode
 from ..state.database import Database
 from ..state.database_hydration import reconstruct_org_config_from_db
@@ -248,6 +248,7 @@ async def run_pipeline(
                             sync=current_org_config.settings.sync,
                             sync_max_rounds=current_org_config.settings.sync_max_rounds,
                             sync_round_timeout_seconds=current_org_config.settings.sync_round_timeout_seconds,
+                            turn_policy=TurnPolicy.from_settings(current_org_config.settings),
                         )
                     outcome = orchestrator.outcome
 
