@@ -37,6 +37,7 @@ from claude_agent_sdk import (
 )
 
 from ..auth import ResolvedAuth
+from ..providers import cost_from_usage, gateway_env, is_gateway_model
 from ..state.registry import Registry
 from ..state.task_store import TaskStore
 from ..state.transcript import NoOpTranscriptLogger, TranscriptLoggerProtocol
@@ -329,6 +330,10 @@ class ClaudeRunner(AgentRunner):
                 "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "3600000",
                 "CLAUDE_CONFIG_DIR": str(Path(self._working_directory).parent / ".sessions" / agent_id),
                 **({"ANTHROPIC_API_KEY": self._api_key} if self._api_key else {}),
+                # A non-Anthropic model is reached through the local gateway
+                # instead. Merged last so it overwrites the Anthropic key above:
+                # that credential must not be sent to a third-party endpoint.
+                **gateway_env(config.model),
             },
         )
 
@@ -423,21 +428,31 @@ class ClaudeRunner(AgentRunner):
                 elif message.num_turns >= config.max_turns:
                     error = f"Agent exhausted max_turns ({config.max_turns})"
 
+                # Claude Code prices a run against its own Anthropic table, so
+                # for a gateway model total_cost_usd is wrong rather than
+                # approximate. Recompute from tokens when a price is configured;
+                # None otherwise, so provenance records "unknown" not a fiction.
+                if is_gateway_model(config.model):
+                    cost_usd = cost_from_usage(config.model, message.usage)
+                else:
+                    cost_usd = message.total_cost_usd
+
                 result = AgentRunResult(
                     error=error,
                     num_turns=message.num_turns,
-                    cost_usd=message.total_cost_usd,
+                    cost_usd=cost_usd,
                     duration_ms=message.duration_ms,
                     session_id=message.session_id,
                 )
 
+                cost_note = f"${cost_usd:.4f}" if cost_usd is not None else "unknown"
                 self._framework_logger.info(
-                    f"Agent {agent_id} finished: turns={message.num_turns}, cost=${message.total_cost_usd or 0:.4f}"
+                    f"Agent {agent_id} finished: turns={message.num_turns}, cost={cost_note}"
                 )
                 self.transcript_logger.log_run_complete(
                     agent_id,
                     message.num_turns,
-                    message.total_cost_usd,
+                    cost_usd,
                     error,
                 )
                 if message.session_id:
