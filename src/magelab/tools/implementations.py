@@ -36,13 +36,25 @@ def create_tool_implementations(
     registry: Registry,
     agent_id: str,
     wire_store: WireStore,
+    broadcast_groups: Optional[list[str]] = None,
 ) -> dict[str, Callable[..., Awaitable[ToolResponse]]]:
     """
     Create framework tool handler functions for a given agent.
 
     Each handler closes over task_store, registry, and agent_id.
     Returns {tool_name: async_handler} — plain functions returning ToolResponse.
+
+    broadcast_groups names network groups that must be addressed whole (see
+    OrgSettings.wire_broadcast_groups). Where this agent belongs to one, it cannot
+    send a message that reaches only part of it.
     """
+    # Fellow members this agent must always include, resolved once per agent.
+    required_participants: set[str] = set()
+    for group_name in broadcast_groups or []:
+        members = registry.get_group_members(group_name)
+        if agent_id in members:
+            required_participants |= members
+    required_participants.discard(agent_id)
 
     def _handle_errors(fn: Callable[..., Awaitable[ToolResponse]]) -> Callable[..., Awaitable[ToolResponse]]:
         """Decorator: catches KeyError → 'Missing required field' and ValueError → 'Error: ...'."""
@@ -57,6 +69,20 @@ def create_tool_implementations(
                 return ToolResponse(f"Error: {e}", is_error=True)
 
         return wrapper
+
+    def _missing_from_broadcast(participants: set[str]) -> list[str]:
+        """Fellow broadcast-group members this participant set would leave out."""
+        return sorted(required_participants - participants)
+
+    def _broadcast_refusal(missing: list[str]) -> ToolResponse:
+        return ToolResponse(
+            f"This message would not reach {', '.join(missing)}. You are in a group that "
+            "must be addressed as a whole, so every message you send has to include all "
+            f"of: {', '.join(sorted(required_participants))}. Add the missing "
+            "recipients and send again, or reply to the conversation that already has "
+            "everyone in it. Private side conversations are not available to you.",
+            is_error=True,
+        )
 
     def _get_connection_tools(target_id: str) -> set[str]:
         """Union of tool names across agents connected to target_id."""
@@ -454,6 +480,10 @@ def create_tool_implementations(
                         is_error=True,
                     )
 
+            missing = _missing_from_broadcast(set(wire.participants))
+            if missing:
+                return _broadcast_refusal(missing)
+
             await wire_store.add_message(conversation_id, agent_id, body)
             return ToolResponse(f"Message sent in conversation {conversation_id}")
 
@@ -467,6 +497,10 @@ def create_tool_implementations(
         # Reject self-only messaging
         if set(recipients) == {agent_id}:
             return ToolResponse("Cannot send a message to only yourself", is_error=True)
+
+        missing = _missing_from_broadcast({*recipients, agent_id})
+        if missing:
+            return _broadcast_refusal(missing)
 
         # Validate recipients are connected to sender
         for rid in recipients:

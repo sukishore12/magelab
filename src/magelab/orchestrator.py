@@ -390,6 +390,7 @@ class Orchestrator:
                 framework_logger=logger,
                 post_tool_hooks=post_tool_hooks,
                 auth=auth,
+                broadcast_groups=settings.wire_broadcast_groups,
             )
 
             # 5. Restore session IDs and apply resume logic

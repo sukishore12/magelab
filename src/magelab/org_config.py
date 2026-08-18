@@ -137,6 +137,21 @@ class OrgSettings:
     """Agent ids pinned to the front of every round, in the order listed (e.g. a
     facilitator that opens each round). Everyone else is shuffled behind them."""
 
+    wire_broadcast_groups: list[str] = field(default_factory=list)
+    """Network groups whose members must address the whole group when they speak.
+
+    A member of a listed group cannot send a message that reaches only some of the
+    group: send_message refuses any recipient set (or reply to any conversation)
+    that omits a fellow member, naming who is missing. Supersets are fine — pulling
+    in an agent from outside the group is still allowed.
+
+    Empty (the default) leaves messaging unrestricted, so existing orgs are
+    unaffected. Set it where a shared record matters and a side channel would
+    corrupt it: a deliberating assembly whose members must all hear each argument,
+    a review panel that must not caucus privately. Without it, a member can quietly
+    address the chair alone and its reasoning never reaches its peers, which looks
+    identical to ordinary participation in the transcript."""
+
     def __post_init__(self) -> None:
         """Validate settings."""
         errors = self._validate()
@@ -169,6 +184,9 @@ class OrgSettings:
             errors.append("sync_turn_seed can only be specified when sync_turn_taking=True")
         if self.sync_turn_first and not self.sync_turn_taking:
             errors.append("sync_turn_first can only be specified when sync_turn_taking=True")
+        for name in self.wire_broadcast_groups:
+            if not name or not name.strip():
+                errors.append("wire_broadcast_groups entries must be non-empty group names")
         return errors
 
 
@@ -352,6 +370,17 @@ class OrgConfig:
             if agent.max_turns_override is not None and agent.max_turns_override <= 0:
                 errors.append(
                     f"Agent '{agent.agent_id}' has max_turns_override={agent.max_turns_override}, must be > 0"
+                )
+
+        # A broadcast group has to be a group the network actually declares —
+        # a typo would otherwise disable the constraint silently.
+        for name in self.settings.wire_broadcast_groups:
+            if self.network is None:
+                errors.append(f"wire_broadcast_groups names '{name}' but the org has no network")
+            elif name not in self.network.groups:
+                errors.append(
+                    f"wire_broadcast_groups names unknown network group '{name}' "
+                    f"(known: {sorted(self.network.groups) or 'none'})"
                 )
 
         # Check network ↔ agents consistency (both directions)

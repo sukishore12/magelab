@@ -85,6 +85,7 @@ def create_framework_tools_server(
     agent_id: str,
     role_tools: list[str],
     wire_store: WireStore,
+    broadcast_groups: Optional[list[str]] = None,
 ) -> Any:
     """
     Create MCP server with framework tools for a specific agent.
@@ -95,7 +96,9 @@ def create_framework_tools_server(
     Only registers tools that the agent's role has access to, so the model
     never sees tool definitions it cannot use (which causes retry loops).
     """
-    impls = create_tool_implementations(task_store, registry, agent_id, wire_store=wire_store)
+    impls = create_tool_implementations(
+        task_store, registry, agent_id, wire_store=wire_store, broadcast_groups=broadcast_groups
+    )
 
     role_tool_set = set(role_tools)
     sdk_tools = []
@@ -245,6 +248,7 @@ class ClaudeRunner(AgentRunner):
         framework_logger: Optional[logging.Logger] = None,
         post_tool_hooks: Optional[list] = None,
         auth: Optional[ResolvedAuth] = None,
+        broadcast_groups: Optional[list[str]] = None,
     ) -> None:
         super().__init__(post_tool_hooks)
         self._permission_mode = permission_mode
@@ -269,7 +273,12 @@ class ClaudeRunner(AgentRunner):
             agent_mcp_proxies = _build_agent_mcp_proxies(agent_id, resolved_tools, mcp_servers)
 
             mcp_server = create_framework_tools_server(
-                task_store, registry, agent_id, resolved_tools, wire_store=wire_store
+                task_store,
+                registry,
+                agent_id,
+                resolved_tools,
+                wire_store=wire_store,
+                broadcast_groups=broadcast_groups,
             )
             allowed_tools = build_allowed_tools(resolved_tools, self._framework_logger)
             disallowed_tools = build_disallowed_tools(resolved_tools)

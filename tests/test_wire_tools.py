@@ -481,3 +481,97 @@ class TestEventNotifications:
         ws.add_event_listener(lambda e: emitted.append(e))
         await ws.add_message("w1", "bob", "Reply")
         assert len(emitted) == 0
+
+
+# =============================================================================
+# wire_broadcast_groups — a group that must be addressed as a whole
+# =============================================================================
+
+
+def _setup_assembly(agent_id: str) -> tuple[WireStore, Registry, TaskStore, dict]:
+    """A three-member group under a broadcast constraint, plus an outsider.
+
+    Network: assembly = {a1, a2, a3} as a group; observer connected to a1 only.
+    """
+    roles = {
+        "member": RoleConfig(
+            name="member", role_prompt="Deliberate", tools=["communication"], model="test", max_turns=10
+        ),
+    }
+    agents = {
+        "a1": AgentConfig(agent_id="a1", role="member"),
+        "a2": AgentConfig(agent_id="a2", role="member"),
+        "a3": AgentConfig(agent_id="a3", role="member"),
+        "observer": AgentConfig(agent_id="observer", role="member"),
+    }
+    network = NetworkConfig(
+        groups={"assembly": ["a1", "a2", "a3"]},
+        connections={"observer": ["a1", "a2", "a3"]},
+    )
+    store = TaskStore(framework_logger=_test_logger)
+    wire_store = WireStore(framework_logger=_test_logger)
+    registry = Registry(framework_logger=_test_logger)
+    registry.register_config(roles, agents, network)
+    impls = create_tool_implementations(
+        store, registry, agent_id, wire_store=wire_store, broadcast_groups=["assembly"]
+    )
+    return wire_store, registry, store, impls
+
+
+@pytest.mark.asyncio
+async def test_broadcast_group_refuses_partial_recipients():
+    """The failure this exists for: a member messaging one peer, leaving the rest out."""
+    _, _, _, impls = _setup_assembly("a1")
+    res = await impls["send_message"]({"recipients": ["a2"], "body": "just between us"})
+    assert res.is_error
+    assert "a3" in res.text
+    assert "a3" in res.text.split("must be addressed")[0]  # a3 is named as missing
+
+
+@pytest.mark.asyncio
+async def test_broadcast_group_allows_whole_group():
+    _, _, _, impls = _setup_assembly("a1")
+    res = await impls["send_message"]({"recipients": ["a2", "a3"], "body": "everyone hears this"})
+    assert not res.is_error
+
+
+@pytest.mark.asyncio
+async def test_broadcast_group_allows_superset_with_outsider():
+    """Pulling in someone outside the group is fine — only omissions are refused."""
+    _, _, _, impls = _setup_assembly("a1")
+    res = await impls["send_message"]({"recipients": ["a2", "a3", "observer"], "body": "hi all"})
+    assert not res.is_error
+
+
+@pytest.mark.asyncio
+async def test_broadcast_group_refuses_reply_on_narrower_wire():
+    """A pre-existing two-party wire cannot be used to bypass the constraint."""
+    wire_store, registry, store, a1 = _setup_assembly("a1")
+    # An outsider opens a wire with a1 alone; a1 must not be able to reply on it.
+    outsider = create_tool_implementations(
+        store, registry, "observer", wire_store=wire_store, broadcast_groups=["assembly"]
+    )
+    opened = await outsider["send_message"]({"recipients": ["a1"], "body": "psst"})
+    assert not opened.is_error
+    wire_id = opened.text.split()[-1]
+
+    res = await a1["send_message"]({"conversation_id": wire_id, "body": "quietly back"})
+    assert res.is_error
+    assert "a2" in res.text and "a3" in res.text
+
+
+@pytest.mark.asyncio
+async def test_no_broadcast_groups_leaves_messaging_unrestricted():
+    """Default-off: an org that does not opt in behaves exactly as before."""
+    _, _, _, impls = _setup_assembly("a1")  # constrained
+    _, _, _, free = _setup("alice")  # no broadcast_groups
+    assert (await impls["send_message"]({"recipients": ["a2"], "body": "x"})).is_error
+    assert not (await free["send_message"]({"recipients": ["bob"], "body": "x"})).is_error
+
+
+@pytest.mark.asyncio
+async def test_non_member_is_unconstrained():
+    """The constraint binds group members, not everyone in the org."""
+    _, _, _, obs = _setup_assembly("observer")
+    res = await obs["send_message"]({"recipients": ["a1"], "body": "one-to-one is fine for me"})
+    assert not res.is_error

@@ -378,6 +378,17 @@ class Registry:
             return None
         return self._network.to_config()
 
+    def get_group_members(self, group_name: str) -> set[str]:
+        """Members of a network group, or an empty set if the group is unknown.
+
+        Includes agents the group declares whether or not they are still active —
+        callers enforcing a group-wide audience want the declared membership, not
+        whoever happens to be running.
+        """
+        if self._network is None:
+            return set()
+        return set(self._network.to_config().groups.get(group_name, []))
+
     def get_connected_ids(self, agent_id: str, *, active_only: bool = True) -> list[str]:
         """Get list of connected agent IDs based on network topology.
 
