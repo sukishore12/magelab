@@ -52,7 +52,7 @@ from .state.task_schemas import (
 from .state.task_store import TaskStore
 from .state.transcript import TranscriptLogger
 from .state.wire_store import WireStore
-from .tools.mcp import LoadedMCPModule, MCPContext, init_mcp_servers, load_mcp_module
+from .tools.mcp import LoadedMCPModule, MCPContext, init_mcp_servers, load_mcp_module, stop_reason
 from .tools.validation import validate_all_tool_dependencies, validate_task_assignments
 
 logger = logging.getLogger(__name__)
@@ -276,13 +276,19 @@ class Orchestrator:
 
         self._running = False
         self._interrupted = False
+        self.stopped_early = None
         self._agent_tasks: dict[str, asyncio.Task] = {}  # agent_id -> asyncio task
         self._event_listeners: list[Callable[[Event], None]] = []
         self._turn_policy: TurnPolicy = TurnPolicy()
         self._events_to_process: int = 0
+        # Loaded MCP modules, for the optional should_stop() round-boundary hook.
+        # Populated by build() after the modules are initialized.
+        self._mcp_modules: dict[str, LoadedMCPModule] = {}
 
         # Run results — set during the run or at finalization
         self.timed_out: bool = False
+        self.stopped_early: Optional[str] = None
+        """Why an MCP module ended the run at a round boundary, if one did."""
         self.sync_rounds: Optional[int] = None
         self.turn_orders: list[list[str]] = []  # turn-taking mode: the order drawn each round
         self.outcome: RunOutcome = RunOutcome.NO_WORK
@@ -423,6 +429,8 @@ class Orchestrator:
             if mcp_modules:
                 mcp_context = MCPContext(db=db, emit_event=orch._dispatch_event)
                 init_mcp_servers(mcp_modules, mcp_context, logger)
+                # Kept for the optional should_stop() hook checked each round.
+                orch._mcp_modules = mcp_modules
         except Exception:
             db.close()
             raise
@@ -837,6 +845,16 @@ class Orchestrator:
                 return
 
             self.sync_rounds = round_num
+
+            # Round boundary: the round is over and recorded, so a module whose
+            # terminal condition is defined at a boundary (a vote that carries as
+            # the round closes) can now answer. Checked here rather than mid-round
+            # so a module never has to reason about a half-finished round.
+            reason = stop_reason(self._mcp_modules, round_num, self._framework_logger)
+            if reason:
+                self.stopped_early = reason
+                self._framework_logger.info(f"Stopping after round {round_num}: {reason}")
+                return
 
         self._framework_logger.warning(f"Max rounds ({sync_max_rounds}) reached")
 

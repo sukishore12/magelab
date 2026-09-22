@@ -139,6 +139,47 @@ def init_mcp_servers(
             raise RuntimeError(f"Failed to initialize MCP module '{server_name}': {e}") from e
 
 
+def stop_reason(
+    loaded_modules: dict[str, LoadedMCPModule],
+    round_num: int,
+    framework_logger: Optional[logging.Logger] = None,
+) -> Optional[str]:
+    """Ask each MCP module whether the run should end, and why.
+
+    A module may define an optional ``should_stop(round_num) -> str | None``
+    alongside its ``server`` and ``init``. It is called at every round boundary,
+    after the round has been recorded, and a non-empty string ends the run with
+    that string as the reason.
+
+    This exists because a sync org has only one native early exit — a round in
+    which nobody speaks — and that is a proxy for "the work is done", not a
+    statement of it. An experiment with a real terminal condition (a vote that
+    carries, a market that clears, an auction that closes) knows it is finished
+    while the agents are still talking, and without this it can only get there by
+    instructing every agent to fall silent and then burning a round proving they
+    did.
+
+    Errors are logged and treated as "do not stop": a broken predicate must not be
+    able to end a run early, which would look exactly like a successful one.
+    """
+    log = framework_logger or _logger
+    for server_name, loaded in loaded_modules.items():
+        fn = getattr(loaded.module, "should_stop", None)
+        if fn is None:
+            continue
+        if not callable(fn):
+            log.warning(f"MCP module '{server_name}' has a 'should_stop' attribute that is not callable")
+            continue
+        try:
+            reason = fn(round_num)
+        except Exception:
+            log.exception(f"MCP module '{server_name}' should_stop() failed; continuing the run")
+            continue
+        if reason:
+            return str(reason)
+    return None
+
+
 # =============================================================================
 # Per-agent proxy with agent_id injection
 # =============================================================================
