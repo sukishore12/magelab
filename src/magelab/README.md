@@ -116,17 +116,20 @@ Initial tasks and messages are idempotent on resume — if they already exist in
 
 ### Sync mode
 
-The orchestrator drives discrete rounds instead of running persistent agent loops. In each round, all agent queues are drained and events are processed — sequential within an agent, concurrent across agents. The org terminates when a full round produces no new events (convergence) or `sync_max_rounds` is reached.
+The orchestrator drives discrete rounds instead of running persistent agent loops. A round is always **turn-taking**: agents run one at a time, in an order drawn for that round, and each drains its own queue when its turn arrives — so a later speaker sees what earlier speakers said in the SAME round. The org terminates when a full round produces no new events (convergence) or `sync_max_rounds` is reached.
 
 ```
-run() → _run_with_lifecycle          # same wrapper as async
-          └─ _run_sync_rounds        # drive discrete rounds
-              └─ per round:
-                  drain queues → _run_agent_events_sequential  # one list per agent
-                                  └─ _run_agent_for_event      # same as async
+run() → _run_with_lifecycle             # same wrapper as async
+          └─ _run_sync_rounds           # drive discrete rounds
+              └─ _run_round_turn_taking # per round: TurnPolicy.draw() → order
+                  └─ per agent, in order:
+                      drain its queue → _run_agent_events_sequential
+                                         └─ _run_agent_for_event   # same as async
 ```
 
-**Rounds** (`_run_sync_rounds`). Each round drains all agent queues, then processes the events via `asyncio.gather` — all agents run concurrently, but each agent processes its events sequentially. An optional per-round timeout can be set via `sync_round_timeout_seconds`.
+**Rounds** (`_run_sync_rounds` → `_run_round_turn_taking`). `TurnPolicy` draws the round's order — agents in `sync_turn_first` pinned to the front, the rest shuffled from a stream keyed on `(seed, round_num)`, or left in registry order with `sync_turn_order: "config"`. Each agent then runs to completion before the next one starts; an agent whose queue is empty at its turn is skipped and does not get a second chance that round. The order drawn and who actually spoke are recorded to `run_turn_orders`. An optional per-round timeout can be set via `sync_round_timeout_seconds` — it covers the whole round, i.e. the sum of every turn in it, and whoever is still queued when it fires simply does not speak that round.
+
+There is no all-at-once round, and that is deliberate rather than unfinished. Draining every queue up front and running the agents concurrently makes delivery within a round a race: an agent that finishes early leaks into a slower agent's prompt, so "what did this agent know when it spoke" has no stable answer and a round cannot be reconstructed after the fact.
 
 ### Event dispatch
 

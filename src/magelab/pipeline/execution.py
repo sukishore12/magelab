@@ -248,7 +248,11 @@ async def run_pipeline(
                             sync=current_org_config.settings.sync,
                             sync_max_rounds=current_org_config.settings.sync_max_rounds,
                             sync_round_timeout_seconds=current_org_config.settings.sync_round_timeout_seconds,
-                            turn_policy=TurnPolicy.from_settings(current_org_config.settings),
+                            turn_policy=(
+                                TurnPolicy.from_settings(current_org_config.settings)
+                                if current_org_config.settings.sync
+                                else None
+                            ),
                         )
                     outcome = orchestrator.outcome
 

@@ -120,14 +120,13 @@ class OrgSettings:
     sync_round_timeout_seconds: Optional[float] = None
     """Max time (seconds) per sync round. Only valid when sync=True. None = no per-round limit."""
 
-    sync_turn_taking: bool = False
-    """If True, a sync round runs one agent at a time instead of all at once. Each
-    agent drains its queue at the START OF ITS OWN TURN, so it sees what earlier
-    speakers said in the SAME round. Only valid when sync=True."""
-
     sync_turn_order: str = "random"
     """Turn order within a round: "random" (fresh shuffle every round) or "config"
-    (registry order, stable across rounds). Only used when sync_turn_taking=True."""
+    (registry order, stable across rounds). Only used when sync=True.
+
+    A sync round is ALWAYS turn-taking: agents run one at a time, each draining its
+    queue at the START OF ITS OWN TURN, so it sees what earlier speakers said in the
+    SAME round. There is no all-at-once round — see TurnPolicy."""
 
     sync_turn_seed: Optional[int] = None
     """Seed for the per-round shuffle. None = drawn at run start, then logged and
@@ -176,14 +175,12 @@ class OrgSettings:
             errors.append("sync_round_timeout_seconds can only be specified when sync=True")
         if self.sync_round_timeout_seconds is not None and self.sync_round_timeout_seconds <= 0:
             errors.append(f"sync_round_timeout_seconds must be > 0, got {self.sync_round_timeout_seconds}")
-        if self.sync_turn_taking and not self.sync:
-            errors.append("sync_turn_taking can only be enabled when sync=True")
         if self.sync_turn_order not in ("random", "config"):
             errors.append(f"sync_turn_order must be 'random' or 'config', got {self.sync_turn_order!r}")
-        if self.sync_turn_seed is not None and not self.sync_turn_taking:
-            errors.append("sync_turn_seed can only be specified when sync_turn_taking=True")
-        if self.sync_turn_first and not self.sync_turn_taking:
-            errors.append("sync_turn_first can only be specified when sync_turn_taking=True")
+        if self.sync_turn_seed is not None and not self.sync:
+            errors.append("sync_turn_seed can only be specified when sync=True")
+        if self.sync_turn_first and not self.sync:
+            errors.append("sync_turn_first can only be specified when sync=True")
         for name in self.wire_broadcast_groups:
             if not name or not name.strip():
                 errors.append("wire_broadcast_groups entries must be non-empty group names")

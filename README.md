@@ -203,7 +203,10 @@ All behavioral settings live under the `settings:` key.
 | `agent_timeout_seconds` | float | `900` | Max time for a single agent dispatch (default: 15 min). |
 | `sync` | bool | `false` | Use synchronized round-based execution. See [Execution modes](#execution-modes). |
 | `sync_max_rounds` | int | — | Required when `sync: true`. |
-| `sync_round_timeout_seconds` | float | — | Per-round timeout. Only valid when `sync: true`. |
+| `sync_round_timeout_seconds` | float | — | Per-round timeout, covering every turn in the round. Only valid when `sync: true`. |
+| `sync_turn_order` | string | `"random"` | Speaking order within a round: `"random"` (fresh shuffle each round) or `"config"` (registry order). |
+| `sync_turn_seed` | int | — | Seed for the shuffle. Omit to draw one at run start; set it to replay a run's exact orders. Only valid when `sync: true`. |
+| `sync_turn_first` | list | `[]` | Agent ids pinned to the front of every round (e.g. a chair). Everyone else is shuffled behind them. Only valid when `sync: true`. |
 | `wire_notifications` | string | `"all"` | Wire notification mode: `"all"`, `"tool"`, `"event"`, or `"none"`. See [Wire notifications](#wire-notifications). |
 | `wire_max_unread_per_prompt` | int | `10` | Max unread conversations delivered in a single wire event prompt. |
 | `agent_settings_dir` | string | — | Path to per-role settings (relative to config file). See [Extension points](#extension-points). |
@@ -902,19 +905,24 @@ Each agent runs as a concurrent loop: pull an event from its queue, process it, 
 
 ### Sync
 
-The orchestrator drives discrete rounds. Each round:
-1. Drains all agent queues
-2. Processes those events (sequential per agent, concurrent across agents)
-3. New events generated during the round are queued for the *next* round
+The orchestrator drives discrete rounds, and agents take **turns**: a round has a speaking order, and each agent runs to completion before the next one starts. Each round:
+1. Draws the round's order — `sync_turn_first` pinned to the front, the rest shuffled (or left in registry order with `sync_turn_order: "config"`)
+2. Runs each agent in that order. An agent drains its own queue **at the start of its own turn**, so it sees what everyone ahead of it said *this* round; an agent whose queue is empty when its turn comes is skipped for the round
+3. Events generated after an agent's turn are queued for the *next* round
 
-This creates clean round boundaries — everything in round N is based only on events from round N-1. Terminates when no events remain, or `sync_max_rounds` is reached.
+So a round boundary is a boundary in one direction only: you hear everyone ahead of you in your own round, and nobody behind you hears you until the next. Terminates when a round produces no events, or `sync_max_rounds` is reached. The order drawn and who actually spoke are recorded per round to `run_turn_orders`.
 
 ```yaml
 settings:
   sync: true
   sync_max_rounds: 20
-  sync_round_timeout_seconds: 300  # 5 min per round
+  sync_round_timeout_seconds: 300  # 5 min for the WHOLE round — all turns in it
+  sync_turn_order: random          # fresh shuffle every round
+  sync_turn_first: [facilitator]   # the chair opens; everyone else shuffled behind
+  # sync_turn_seed: 12345          # set to replay a run's exact orders
 ```
+
+There is no all-at-once round, and that is deliberate rather than unfinished: running a round's agents concurrently against a frozen snapshot of the previous round makes delivery within the round a race, so an agent that finishes early leaks into a slower agent's prompt and no one can say afterwards what any agent knew when it spoke.
 
 ---
 

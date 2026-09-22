@@ -16,7 +16,7 @@ import pytest
 
 from magelab.org_config import WireNotifications
 from magelab.registry_config import AgentConfig, RoleConfig
-from magelab.orchestrator import Orchestrator
+from magelab.orchestrator import Orchestrator, TurnPolicy
 from magelab.state.database import Database
 from magelab.state.registry import Registry
 from magelab.state.task_schemas import Task, TaskStatus
@@ -445,7 +445,14 @@ class TestWireEventBatching:
     @pytest.mark.asyncio
     async def test_first_wire_event_fetches_all_unread(self):
         """When multiple wire events are queued, the first one fetches all unread
-        wires for the agent. Subsequent wire events go stale."""
+        wires for the agent. Subsequent wire events go stale.
+
+        Bob has to speak LAST for both senders' events to be waiting at its turn, so
+        the round order is pinned rather than drawn: a round is always turn-taking,
+        and with a random order bob could be woken between the two sends and answer
+        each in a round of its own — two dispatches, both carrying genuinely unread
+        messages. That is correct behaviour, but it is not the batching this asserts.
+        """
         store, registry, runner, wire_store, db = _make_wire_org()
         orch = _make_orchestrator(store, registry, runner, wire_store=wire_store, db=db)
 
@@ -476,6 +483,7 @@ class TestWireEventBatching:
             initial_tasks=[(t1, "alice", "User"), (t2, "bob", "User"), (t3, "carol", "User")],
             sync=True,
             sync_max_rounds=5,
+            turn_policy=TurnPolicy(order="config", first=("alice", "carol")),
         )
 
         # bob gets ONE wire dispatch (first event fetches all unread, second goes stale)
@@ -495,7 +503,12 @@ class TestWireEventBatching:
     @pytest.mark.asyncio
     async def test_wire_batch_uses_batch_template(self):
         """When multiple wire events are batched, the prompt should use the batch template
-        ('You have new messages.') not the single template."""
+        ('You have new messages.') not the single template.
+
+        Both senders must speak before bob for their events to batch at bob's turn, so
+        the round order is pinned rather than drawn — a round is always turn-taking,
+        and a random order can wake bob between the two sends instead.
+        """
         store, registry, runner, wire_store, db = _make_wire_org()
         orch = _make_orchestrator(store, registry, runner, wire_store=wire_store, db=db)
 
@@ -525,6 +538,7 @@ class TestWireEventBatching:
             initial_tasks=[(t1, "alice", "User"), (t2, "bob", "User"), (t3, "carol", "User")],
             sync=True,
             sync_max_rounds=5,
+            turn_policy=TurnPolicy(order="config", first=("alice", "carol")),
         )
 
         bob_calls = [c for c in runner.calls if c[0] == "bob"]
@@ -560,7 +574,12 @@ class TestWireEventBatching:
 
     @pytest.mark.asyncio
     async def test_wire_batch_stale_extras_skipped(self):
-        """In a batch, stale extra events should be skipped while live ones are included."""
+        """In a batch, stale extra events should be skipped while live ones are included.
+
+        Both senders must speak before bob for their events to batch at bob's turn, so
+        the round order is pinned rather than drawn — a round is always turn-taking,
+        and a random order can wake bob between the two sends instead.
+        """
         store, registry, runner, wire_store, db = _make_wire_org()
         orch = _make_orchestrator(store, registry, runner, wire_store=wire_store, db=db)
 
@@ -592,6 +611,7 @@ class TestWireEventBatching:
             initial_tasks=[(t1, "alice", "User"), (t2, "bob", "User"), (t3, "carol", "User")],
             sync=True,
             sync_max_rounds=5,
+            turn_policy=TurnPolicy(order="config", first=("alice", "carol")),
         )
 
         # Only conv-2 should have a wire dispatch (conv-1 was stale)

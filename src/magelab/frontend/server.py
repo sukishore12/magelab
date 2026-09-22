@@ -394,7 +394,7 @@ async def run_with_frontend(
             sync=org_config.settings.sync,
             sync_max_rounds=org_config.settings.sync_max_rounds,
             sync_round_timeout_seconds=org_config.settings.sync_round_timeout_seconds,
-            turn_policy=TurnPolicy.from_settings(org_config.settings),
+            turn_policy=TurnPolicy.from_settings(org_config.settings) if org_config.settings.sync else None,
         )
 
         # 8. Broadcast run_finished

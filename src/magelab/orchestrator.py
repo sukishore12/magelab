@@ -173,19 +173,19 @@ def _copy_session_configs(
 
 @dataclasses.dataclass(frozen=True)
 class TurnPolicy:
-    """How the agents of a sync round are scheduled against each other.
+    """The speaking order of a sync round.
 
-    Default (``enabled=False``) is the original all-at-once round: every queue is
-    drained up front and every agent runs concurrently against the same frozen
-    snapshot of the previous round, so nobody can answer anything said in their own
-    round.
+    Every sync round is turn-taking: agents run ONE AT A TIME, each draining its own
+    queue when its turn arrives, so a later speaker sees what the earlier speakers
+    said in the SAME round. This policy only decides who goes when.
 
-    With ``enabled=True`` the round becomes turn-taking: agents run one at a time,
-    each draining its own queue when its turn arrives, so a later speaker sees what
-    the earlier speakers said in the SAME round.
+    There is no all-at-once alternative, deliberately. Draining every queue up front
+    and running the agents concurrently would make delivery within a round a race
+    rather than a guarantee — an agent that finishes early leaks into a slower
+    agent's prompt — so "what did this agent know when it spoke" would have no stable
+    answer and a round could not be reconstructed after the fact.
     """
 
-    enabled: bool = False
     order: str = "random"
     """"random" — fresh shuffle every round; "config" — registry order, every round."""
     seed: Optional[int] = None
@@ -200,7 +200,6 @@ class TurnPolicy:
     def from_settings(cls, settings: "OrgSettings") -> "TurnPolicy":
         """Build from an OrgSettings' sync_turn_* fields."""
         return cls(
-            enabled=settings.sync_turn_taking,
             order=settings.sync_turn_order,
             seed=settings.sync_turn_seed,
             first=tuple(settings.sync_turn_first),
@@ -469,8 +468,8 @@ class Orchestrator:
             sync: If True, run in synchronized round-based mode (no agent loops).
             sync_max_rounds: Maximum number of rounds. Required when sync=True.
             sync_round_timeout_seconds: Max time per sync round. None = no per-round limit.
-            turn_policy: How agents are scheduled within a round. None or a policy with
-                enabled=False keeps the all-at-once round. Only valid when sync=True.
+            turn_policy: The speaking order within a round. None = the default policy
+                (random order, nobody pinned first). Only valid when sync=True.
         """
         if sync_max_rounds is not None and not sync:
             raise ValueError("sync_max_rounds can only be specified when sync=True")
@@ -478,8 +477,8 @@ class Orchestrator:
             raise ValueError("sync_max_rounds is required when sync=True")
         if sync_round_timeout_seconds is not None and not sync:
             raise ValueError("sync_round_timeout_seconds can only be specified when sync=True")
-        if turn_policy is not None and turn_policy.enabled and not sync:
-            raise ValueError("turn_policy can only be enabled when sync=True")
+        if turn_policy is not None and not sync:
+            raise ValueError("turn_policy can only be specified when sync=True")
         if sync:
             self._turn_policy = self._resolve_turn_policy(turn_policy)
             await self._run_with_lifecycle(
@@ -820,8 +819,6 @@ class Orchestrator:
         replayed turn-for-turn by passing it back in.
         """
         policy = policy or TurnPolicy()
-        if not policy.enabled:
-            return policy
         if policy.seed is None:
             policy = dataclasses.replace(policy, seed=random.randrange(2**31))
         self._framework_logger.info(
@@ -833,10 +830,7 @@ class Orchestrator:
     async def _run_sync_rounds(self, sync_max_rounds: int, sync_round_timeout_seconds: Optional[float] = None) -> None:
         """Execute sync rounds until convergence, all tasks done, or sync_max_rounds reached."""
         for round_num in range(1, sync_max_rounds + 1):
-            if self._turn_policy.enabled:
-                dispatched = await self._run_round_turn_taking(round_num, sync_round_timeout_seconds)
-            else:
-                dispatched = await self._run_round_concurrent(round_num, sync_round_timeout_seconds)
+            dispatched = await self._run_round_turn_taking(round_num, sync_round_timeout_seconds)
 
             if not dispatched:
                 self._framework_logger.info(f"No events after round {round_num - 1} — converged")
@@ -846,47 +840,8 @@ class Orchestrator:
 
         self._framework_logger.warning(f"Max rounds ({sync_max_rounds}) reached")
 
-    async def _run_round_concurrent(self, round_num: int, round_timeout: Optional[float]) -> int:
-        """All-at-once round: drain every queue up front, run every agent concurrently.
-
-        Every agent works from the previous round's messages. Delivery within the
-        round is a race, not a guarantee: each agent's prompt is resolved when its own
-        dispatch starts, so an agent that finishes early can leak into a slower agent's
-        prompt. Turn-taking (TurnPolicy) replaces that race with a defined order.
-
-        Returns the number of agents dispatched (0 = converged).
-        """
-        agent_events: dict[str, list[Event]] = {}
-        for agent_id in self.registry.list_agent_ids():
-            events = self.registry.drain_queue(agent_id)
-            if events:
-                agent_events[agent_id] = events
-
-        if not agent_events:
-            return 0
-
-        self._framework_logger.info(
-            f"Round {round_num}: dispatching events to {len(agent_events)} agents "
-            f"({sum(len(v) for v in agent_events.values())} events total)"
-        )
-
-        # Run all agents concurrently — sequential per agent, concurrent across agents
-        round_coro = asyncio.gather(
-            *(self._run_agent_events_sequential(agent_id, events) for agent_id, events in agent_events.items()),
-            return_exceptions=True,
-        )
-        if round_timeout is not None:
-            try:
-                await asyncio.wait_for(round_coro, timeout=round_timeout)
-            except asyncio.TimeoutError:
-                self._framework_logger.warning(f"Round {round_num} timed out after {round_timeout}s")
-        else:
-            await round_coro
-
-        return len(agent_events)
-
     async def _run_round_turn_taking(self, round_num: int, round_timeout: Optional[float]) -> int:
-        """Turn-taking round: one agent at a time, in this round's drawn order.
+        """Run one sync round: one agent at a time, in this round's drawn order.
 
         Each agent drains its own queue when its turn comes up, so it sees messages
         sent earlier in this same round. An agent whose queue is empty at its turn is
